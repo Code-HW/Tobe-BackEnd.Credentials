@@ -1,0 +1,214 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - '*'
+
+variables:
+  azureSubscription: 'f43c4293-70c8-44cd-b180-825073fcbb61'
+  webAppName: 'ToBe-Credentials'
+  environmentName: 'ToBe-Credentials'
+  vmImageName: 'ubuntu-latest'
+
+stages:
+  - stage: Build
+    displayName: Build stage
+    jobs:
+      - job: Build
+        displayName: Build
+        pool:
+          vmImage: $(vmImageName)
+        steps:
+          - script: |
+              mkdir -p $(Pipeline.Workspace)/.yarn/cache
+            displayName: 'Ensure yarn cache directory exists'
+
+          - task: Cache@2
+            inputs:
+              key: 'yarn | "$(Agent.OS)" | yarn.lock'
+              restoreKeys: |
+                yarn | "$(Agent.OS)"
+              path: $(Pipeline.Workspace)/.yarn/cache
+            displayName: 'Cache yarn dependencies'
+
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '20.x'
+            displayName: 'Install Node.js'
+
+          - script: |
+              npm install -g yarn
+              npm install -g @nestjs/cli
+              yarn install --frozen-lockfile
+              yarn build
+            displayName: 'Yarn install and build'
+
+          - task: ArchiveFiles@2
+            displayName: 'Archive files'
+            inputs:
+              rootFolderOrFile: '$(System.DefaultWorkingDirectory)'
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip
+              replaceExistingArchive: true
+
+          - upload: $(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip
+            artifact: drop
+
+          - script: |
+              if [ "$(Build.SourceBranchName)" == "main" ]; then
+                echo "##vso[task.setvariable variable=ENVIRONMENT]produção"
+              elif [ "$(Build.SourceBranchName)" == "hml" ]; then
+                echo "##vso[task.setvariable variable=ENVIRONMENT]Teste"
+              elif [ "$(Build.SourceBranchName)" == "dev" ]; then
+                echo "##vso[task.setvariable variable=ENVIRONMENT]Desenvolvimento"
+              fi
+            displayName: 'Set environment build'
+
+          - script: |
+              echo "##vso[task.setvariable variable=Build_Status]Success"
+            condition: succeeded()
+            displayName: 'Set check success build'
+
+          - script: |
+              echo "##vso[task.setvariable variable=Build_Status]Failed"
+            condition: failed()
+            displayName: 'Set check failed build'
+
+          - script: |
+              if [ "$(Build_Status)" == "Success" ]; then
+                COLOR="#36a64f"
+                MESSAGE="[$(environmentName)] - Build realizado com sucesso no ambiente $(ENVIRONMENT) :white_check_mark:"
+              elif [ "$(Build_Status)" == "Failed" ]; then
+                COLOR="#D00000"
+                MESSAGE="[$(environmentName)] - Erro no build realizado no ambiente $(ENVIRONMENT) :x:"
+              fi
+              curl -X POST -H 'Content-type: application/json' --data "{
+                \"text\": \"$MESSAGE\",
+                \"attachments\": [
+                  {
+                    \"color\": \"$COLOR\",
+                    \"fields\": [
+                      {
+                        \"title\": \"Commit ID\",
+                        \"value\": \"$(Build.SourceVersion)\",
+                        \"short\": true
+                      },
+                      {
+                        \"title\": \"Status\",
+                        \"value\": \"$(Build_Status)\",
+                        \"short\": true
+                      },
+                      {
+                        \"title\": \"Commit Message\",
+                        \"value\": \"$(Build.SourceVersionMessage)\",
+                        \"short\": true
+                      },
+                      {
+                        \"title\": \"Branch\",
+                        \"value\": \"$(Build.SourceBranchName)\",
+                        \"short\": true
+                      },
+                      {
+                        \"title\": \"Autor\",
+                        \"value\": \"$(Build.RequestedFor)\",
+                        \"short\": true
+                      }
+                    ]
+                  }
+                ]
+              }" $(SLACK_WEBHOOK_URL)
+            displayName: 'Notify Slack on build result'
+
+  - stage: Deploy
+    displayName: Deploy stage
+    dependsOn: Build
+    condition: and(succeeded(), or(eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.SourceBranch'], 'refs/heads/hml'), eq(variables['Build.SourceBranch'], 'refs/heads/dev')))
+    jobs:
+      - deployment: Deploy
+        displayName: Deploy
+        environment: $(environmentName)
+        pool:
+          vmImage: $(vmImageName)
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureWebApp@1
+                  displayName: 'Azure Web App Deploy: ToBe-Credentials'
+                  inputs:
+                    azureSubscription: $(azureSubscription)
+                    appType: webAppLinux
+                    appName: $(webAppName)
+                    runtimeStack: 'NODE|20.x'
+                    package: $(Pipeline.Workspace)/drop/$(Build.BuildId).zip
+                    startUpCommand: node dist/main
+
+                - script: |
+                    if [ "$(Build.SourceBranchName)" == "main" ]; then
+                      echo "##vso[task.setvariable variable=ENVIRONMENT]produção"
+                    elif [ "$(Build.SourceBranchName)" == "hml" ]; then
+                      echo "##vso[task.setvariable variable=ENVIRONMENT]Teste"
+                    elif [ "$(Build.SourceBranchName)" == "dev" ]; then
+                      echo "##vso[task.setvariable variable=ENVIRONMENT]Desenvolvimento"
+                    fi
+                  displayName: 'Set environment deploy'
+
+                - script: |
+                    echo "##vso[task.setvariable variable=Build_Status]Success"
+                  condition: succeeded()
+                  displayName: 'Set check success deploy'
+
+                - script: |
+                    echo "##vso[task.setvariable variable=Build_Status]Failed"
+                  condition: failed()
+                  displayName: 'Set check failed deploy'
+
+                - script: |
+                    if [ "$(Build_Status)" == "Success" ]; then
+                      COLOR="#36a64f"
+                      MESSAGE="[$(environmentName)] - Deploy realizado com sucesso no ambiente $(ENVIRONMENT) :white_check_mark:"
+                    elif [ "$(Build_Status)" == "Failed" ]; then
+                      COLOR="#D00000"
+                      MESSAGE="[$(environmentName)] - Erro no deploy realizado no ambiente $(ENVIRONMENT) :x:"
+                    fi
+                    curl -X POST -H 'Content-type: application/json' --data "{
+                      \"text\": \"$MESSAGE\",
+                      \"attachments\": [
+                        {
+                          \"color\": \"$COLOR\",
+                          \"fields\": [
+                            {
+                              \"title\": \"Commit ID\",
+                              \"value\": \"$(Build.SourceVersion)\",
+                              \"short\": true
+                            },
+                            {
+                              \"title\": \"Status\",
+                              \"value\": \"$(Build_Status)\",
+                              \"short\": true
+                            },
+                            {
+                              \"title\": \"Commit Message\",
+                              \"value\": \"$(Build.SourceVersionMessage)\",
+                              \"short\": true
+                            },
+                            {
+                              \"title\": \"Branch\",
+                              \"value\": \"$(Build.SourceBranchName)\",
+                              \"short\": true
+                            },
+                            {
+                              \"title\": \"Autor\",
+                              \"value\": \"$(Build.RequestedFor)\",
+                              \"short\": true
+                            }
+                          ]
+                        }
+                      ]
+                    }" $(SLACK_WEBHOOK_URL)
+                  displayName: 'Notify Slack on deploy result'
